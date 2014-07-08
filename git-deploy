@@ -1,0 +1,333 @@
+#!/bin/sh
+
+# ------------------------------------------------------------
+# Setup Environment
+# ------------------------------------------------------------
+readonly CURRENTBRANCH=$(git symbolic-ref --short HEAD) 
+readonly PREFLIGHT="testing"
+BRANCHES_live="master" 
+BRANCHES_uat="testing" 
+BRANCHES_hotfix="hotfixes"
+BRANCHES_company="companyprofile"
+
+# ------------------------------------------------------------
+# Defaults
+# ------------------------------------------------------------
+ENVIRONMENT=""
+BRANCH=""
+declare -i PUSH=0
+declare -i DRYRUN=0
+declare -i VERBOSE=0
+
+
+# ------------------------------------------------------------
+# Constant Exit Error Codes
+# ------------------------------------------------------------
+readonly ERROR_USAGE=2
+readonly ERROR_MISSING_ARGUMENTS=3
+readonly ERROR_UPLOAD=4
+readonly ERROR_DOWNLOAD=5
+readonly ERROR_UNKNOWN_PROTOCOL=6
+readonly ERROR_REMOTE_LOCKED=7
+readonly ERROR_GIT=8
+
+# ------------------------------------------------------------
+# Functions
+# ------------------------------------------------------------
+
+usage_long() {
+local pager=$(git config --get core.pager)
+${GIT_PAGER:-${pager:-${PAGER:-less -FRSX}}} << EOF
+USAGE
+    git deploy [<options>] <environment> [<branch>]
+    
+DESCRIPTION
+    Custom script for deploying branches to SavvySME environments. Requires 
+    git-ftp with scope set up for an environment before you can deploy with this 
+    script
+    
+OPTIONS
+    -h, --help
+        Show this help screen
+    -p, --push
+        Push the specified branch to remote repository as well as upload it to 
+        the server
+    -D, --dry-run
+        Simulate only, do not upload or push anything
+    -v,--verbose
+        Verbose mode - gives more information as it runs
+        
+ENVIRONMENT
+    Specify the environment to upload the specified branch to.
+    
+BRANCH
+    Optional - the branch to upload. If not specified, currently checked out 
+    branch is used
+ 
+EOF
+exit 0   
+}
+
+usage() {
+    echo "Usage: git deploy [<options>] <environment> [<branch>]"
+    exit $ERROR_USAGE
+}
+
+print_verbose() {
+    if [ $VERBOSE -eq 1 ]; then
+        echo "$(date): $1"
+    fi
+}
+
+# Simple error printer
+print_error_and_die() {
+    echo "Fatal: $1"
+    exit $2
+}
+
+push(){
+    if [ $PUSH -eq 1 ]; then
+        echo "Pushing $BRANCH"
+        if [ $DRYRUN -eq 0 ] ; then
+            git push --tags origin $BRANCH
+        else 
+            echo Push enabled, but dry-run prevents pushing branch.
+        fi
+    fi
+}
+
+upload(){
+    print_verbose "Starting Upload"
+    ARGS=""
+    if [ $DRYRUN -eq 1 ] ; then
+        print_verbose "FTP: Using dry-run"
+        ARGS="$ARGS --dry-run"
+    fi
+    if [ $VERBOSE -eq 1 ] ; then
+        print_verbose "FTP: Using verbose mode"
+        ARGS="$ARGS --verbose"
+    fi
+    print_verbose "FTP options: $ARGS"
+    
+    if [ $BRANCH != $CURRENTBRANCH ] ; then
+        git checkout $BRANCH
+    fi
+    
+    UPLOADOUTPUT=$(git ftp push -s $ENVIRONMENT $ARGS | tee /dev/tty)
+    
+    if [ $BRANCH != $CURRENTBRANCH ] ; then
+        git checkout $CURRENTBRANCH;
+    fi
+    
+}
+
+tag(){
+    TAG=@${ENVIRONMENT}
+    echo Using tag: ${TAG}
+    
+    if [ $DRYRUN -eq 0 ] ; then
+        print_verbose "Updating tag"
+        
+        if [ "$(git tag -l $TAG)" != "" ] ; then
+            git tag -d $TAG
+        fi
+        
+        if [ "$(git tag -l ${ENVIRONMENT}_current)" != "" ] ; then
+            git tag -d ${ENVIRONMENT}_current
+        fi
+        echo Adding tag: ${TAG}
+        git tag $TAG
+        
+        if [ "$ENVIRONMENT" == "live" ]; then
+            echo Adding live deployment timestamp
+            git tag $(date +%Y%m%d-%k%M%S)
+        fi
+        
+    else 
+        echo "Dry-run prevents updating tags" 
+    fi
+}
+
+#-----------
+# Checks
+#-----------
+check_git_repo() {
+    local git_project_dir="$(git rev-parse --show-toplevel 2>/dev/null)"
+    [ -z "$git_project_dir" ] &&  print_error_and_die "Not a Git repository. Exiting..." $ERROR_GIT
+    cd "$git_project_dir"
+}
+
+check_dirty() {
+    [ $(git status -uno --porcelain | wc -l) -ne 0 ] && print_error_and_die "Dirty repository: You have uncommitted changes. Exiting..." $ERROR_GIT
+}
+
+check_scope() {
+    # try .git-ftp-config
+    [ -n "$SCOPE" ] && [ -f '.git-ftp-config' ] && OUT="$(git config -f '.git-ftp-config' --get git-ftp.$SCOPE.$1)"
+    if [ $? -eq 0 ];
+    then
+        echo $OUT
+        return 0
+    fi
+    [ -f '.git-ftp-config' ] && OUT="$(git config -f '.git-ftp-config' --get git-ftp.$1)"
+    if [ $? -eq 0 ];
+    then
+        echo $OUT
+        return 0
+    fi
+    [ -n "$SCOPE" ] && OUT="$(git config --get git-ftp.$SCOPE.$1)"
+    if [ $? -eq 0 ];
+    then
+        echo $OUT
+        return 0
+    fi
+    OUT="$(git config --get git-ftp.$1)"
+    if [ $? -eq 0 ];
+    then
+        echo $OUT
+        return 0
+    fi
+    [ -n $2 ] && OUT=$2
+    echo $OUT
+}
+
+
+check_environment() {
+    if [ -z $ENVIRONMENT ] ; then
+        echo "No environment specified"
+        usage
+        print_error_and_die "Missing argument: environment" $ERROR_MISSING_ARGUMENTS
+    else
+        print_verbose "Using environment $ENVIRONMENT"
+    fi
+}
+
+check_branch() {
+    print_verbose "Checking Branch"
+    [ -z $BRANCH ] && BRANCH=$CURRENTBRANCH
+    print_verbose "Using branch $BRANCH"
+    # Check the specified environment is known
+    BRANCH_ENV=BRANCHES_${ENVIRONMENT}
+    if [ -z ${!BRANCH_ENV} ]; then
+        print_verbose "Environment $ENVIRONMENT is not restricted to any branch" 
+    elif [ ${!BRANCH_ENV} != $BRANCH ] ; then
+        echo Branch required: $BRANCHES_${!ENVIRONMENT}
+        print_error_and_die "$BRANCH is not the required branch for environment $ENVIRONMENT - should be ${!BRANCH_ENV}" $ERROR_GIT
+    else 
+        local checkbranch=$(git show-branch $BRANCH)
+        local checkbranchcode=$?
+        [ $? -eq 0 ] || print_error_and_die "Specified branch $BRANCH does not exist" $ERROR_GIT;
+    fi
+}
+
+check_live(){
+# IF deploying live, make sure all commits are tested first!
+    if [ "$ENVIRONMENT" == "live" ]; then
+        print_verbose "Checking for untested commits on branch for live"
+        DIFF=$(git cherry "$PREFLIGHT" "$BRANCHES_live")
+        if [ ! -z "$DIFF" ]; then
+            echo "There are untested commits on the live branch! Exiting."
+            exit $ERROR_GIT
+        fi
+        
+    fi
+}
+
+remind(){
+    echo -e "\nChecking for schema changes"
+    if [[ "${UPLOADOUTPUT}" == *\.sql\'* ]] 
+    then
+        # Remind to apply SQL 
+        echo -e "\nDeployment included SQL files. "
+        echo "$UPLOADOUTPUT" | grep '\.sql'
+        while true; do
+            read -p "Would you like to try to run these SQL files now? (y/n)" yn
+            case $yn in
+                [Yy]* )
+                    echo "** This is where I should run remote SQL script import **"
+                    break;;
+                [Nn]* )
+                    echo "Run the scripts manually NOW!"
+                    read -p "Press enter when complete"
+                    break;;
+                *)
+                    echo "Please enter y or n";;
+            esac
+        done
+        # Remind to clear cache
+        echo "Clear the DB schema cache NOW!"
+        read -p "Press enter when complete"
+    else 
+        echo "No SQL scripts detected."
+    fi
+
+}
+
+# ------------------------------------------------------------
+# Main
+# ------------------------------------------------------------
+
+check_git_repo
+
+while test $# != 0
+do
+    case "$1" in
+        -h|--help)
+            usage_long
+            ;;
+        -D|--dry-run)
+            DRYRUN=1;
+            print_verbose "Dry-run enabled"
+            ;;
+        -p|--push)
+            PUSH=1
+            print_verbose "Push branch enabled"
+            ;;
+        -v|--verbose)
+            VERBOSE=1
+            print_verbose "Verbose mode enabled"
+            ;;
+        *)
+            # Get environment
+            if [ -z $ENVIRONMENT ] ; then
+                # try .git-ftp-config
+                [ -f '.git-ftp-config' ] && OUT="$(git config -f '.git-ftp-config' --get git-ftp.$1.url)"
+                if [ $? -eq 0 ];
+                then
+                    ENVIRONMENT="$1"
+                else
+                    OUT="$(git config --get git-ftp.$1.url)"
+                    if [ $? -eq 0 ];
+                    then
+                        ENVIRONMENT="$1"
+                    else
+                        echo Unknown environment: $1
+                        usage
+                    fi
+                fi
+            # pass through anything left as a branch
+            elif [ -z $BRANCH ] ; then
+                BRANCH=$1
+            else 
+                echo Unexpected parameter: $1
+                usage
+            fi
+            ;;
+    esac
+    shift
+done
+
+check_environment
+check_branch
+check_live
+upload
+tag
+push
+remind
+
+#echo "Pushing $branchname;
+#git push origin "$branchname";
+#git checkout $branchname ;
+#echo "Preparing to upload $branchname branch to $1 environment";
+#git ftp push -D -v -s "$1"
+#git checkout $CURRENTBRANCH;
