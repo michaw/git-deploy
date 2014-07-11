@@ -1,20 +1,47 @@
 #!/bin/sh
 
+#    git-deploy script - use with git-ftp to automate deployment
+#    Copyright (C) 2014  Micha Wotton
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
 # ------------------------------------------------------------
 # Setup Environment
 # ------------------------------------------------------------
+# You can make sure that only a certain branch is ever deployed to a particular
+# scope. To specify a branch that must be deployed to a specific scope use 
+# the following syntax:
+# BRANCHES_<scope>="<branch>"
+# for example:
+# BRANCHES_live="master"
+#
+# Alternatively, you can specify this on a per-repository basis using git 
+# config (this is the preferred option). See the README file for details
+#BRANCHES_live="master" 
+#BRANCHES_uat="testing" 
+#BRANCHES_hotfix="hotfixes"
+#BRANCHES_company="companyprofile"
 readonly CURRENTBRANCH=$(git symbolic-ref --short HEAD) 
-readonly PREFLIGHT="testing"
-BRANCHES_live="master" 
-BRANCHES_uat="testing" 
-BRANCHES_hotfix="hotfixes"
-BRANCHES_company="companyprofile"
 
 # ------------------------------------------------------------
 # Defaults
 # ------------------------------------------------------------
 ENVIRONMENT=""
 BRANCH=""
+DEFAULT_PREFLIGHT_BRANCH="testing"
+DEFAULT_PRODUCTION_ENV="live"
+DEFAULT_PRODUCTION_BRANCH="master"
 declare -i PUSH=0
 declare -i DRYRUN=0
 declare -i VERBOSE=0
@@ -36,8 +63,9 @@ readonly ERROR_GIT=8
 # ------------------------------------------------------------
 
 usage_long() {
-local pager=$(git config --get core.pager)
-${GIT_PAGER:-${pager:-${PAGER:-less -FRSX}}} << EOF
+#local pager=$(git config --get core.pager)
+#${GIT_PAGER:-${pager:-${PAGER:-less -FRSX}}} << EOF
+cat << EOF | less
 USAGE
     git deploy [<options>] <environment> [<branch>]
     
@@ -47,7 +75,7 @@ DESCRIPTION
     script
     
 OPTIONS
-    -h, --help
+    -h
         Show this help screen
     -p, --push
         Push the specified branch to remote repository as well as upload it to 
@@ -206,25 +234,35 @@ check_branch() {
     print_verbose "Checking Branch"
     [ -z $BRANCH ] && BRANCH=$CURRENTBRANCH
     print_verbose "Using branch $BRANCH"
-    # Check the specified environment is known
-    BRANCH_ENV=BRANCHES_${ENVIRONMENT}
-    if [ -z ${!BRANCH_ENV} ]; then
+    # Check if the specified environment has a required branch
+    BRANCH_ENV="$(git config --get git-ftp.$ENVIRONMENT.branch)"
+    # [ -z $BRANCH_ENV ] && print_verbose "Checking for default branch for $ENVIRONMENT" && BRANCH_ENV=$BRANCHES_${ENVIRONMENT}
+    if [ -z $BRANCH_ENV ]; then
         print_verbose "Environment $ENVIRONMENT is not restricted to any branch" 
-    elif [ ${!BRANCH_ENV} != $BRANCH ] ; then
-        echo Branch required: $BRANCHES_${!ENVIRONMENT}
-        print_error_and_die "$BRANCH is not the required branch for environment $ENVIRONMENT - should be ${!BRANCH_ENV}" $ERROR_GIT
-    else 
+    elif [ $BRANCH_ENV != $BRANCH ] ; then
+        echo Branch required: $BRANCH_ENV
+        print_error_and_die "$BRANCH is not the required branch for environment $ENVIRONMENT - should be $BRANCH_ENV" $ERROR_GIT
+    else
+        print_verbose "Environment $ENVIRONMENT restricted to $BRANCH_ENV - OK" 
         local checkbranch=$(git show-branch $BRANCH)
         local checkbranchcode=$?
         [ $? -eq 0 ] || print_error_and_die "Specified branch $BRANCH does not exist" $ERROR_GIT;
     fi
 }
 
-check_live(){
+check_production(){
 # IF deploying live, make sure all commits are tested first!
-    if [ "$ENVIRONMENT" == "live" ]; then
-        print_verbose "Checking for untested commits on branch for live"
-        DIFF=$(git cherry "$PREFLIGHT" "$BRANCHES_live")
+    PRODUCTION_ENV="$(git config --get git-ftp.production.scope)"
+    [ -z $PRODUCTION_ENV ] && PRODUCTION_ENV=$DEFAULT_PRODUCTION_ENV
+    if [ "$ENVIRONMENT" == "$PRODUCTION_ENV" ]; then
+        # Check for a preflight branch
+        PREFLIGHT="$(git config --get git-ftp.preflight)"
+        [ -z $PREFLIGHT ] && PREFLIGHT=$DEFAULT_PREFLIGHT_BRANCH
+        # Get production branch
+        PRODUCTION_BRANCH="$(git config --get git-ftp.production.branch)"
+        [ -z $PRODUCTION_BRANCH ] && PRODUCTION_BRANCH=$DEFAULT_PRODUCTION_BRANCH
+        print_verbose "Checking for untested commits on branch for $PROD"
+        DIFF=$(git cherry "$PREFLIGHT" "$PRODUCTION_BRANCH")
         if [ ! -z "$DIFF" ]; then
             echo "There are untested commits on the live branch! Exiting."
             exit $ERROR_GIT
@@ -240,22 +278,11 @@ remind(){
         # Remind to apply SQL 
         echo -e "\nDeployment included SQL files. "
         echo "$UPLOADOUTPUT" | grep '\.sql'
-        while true; do
-            read -p "Would you like to try to run these SQL files now? (y/n)" yn
-            case $yn in
-                [Yy]* )
-                    echo "** This is where I should run remote SQL script import **"
-                    break;;
-                [Nn]* )
-                    echo "Run the scripts manually NOW!"
-                    read -p "Press enter when complete"
-                    break;;
-                *)
-                    echo "Please enter y or n";;
-            esac
-        done
+        echo "Run the scripts manually NOW!"
+        read -p "Press enter when complete"
+                
         # Remind to clear cache
-        echo "Clear the DB schema cache NOW!"
+        echo "Clear DB schema cache NOW!"
         read -p "Press enter when complete"
     else 
         echo "No SQL scripts detected."
@@ -272,7 +299,7 @@ check_git_repo
 while test $# != 0
 do
     case "$1" in
-        -h|--help)
+        -h)
             usage_long
             ;;
         -D|--dry-run)
@@ -319,15 +346,8 @@ done
 
 check_environment
 check_branch
-check_live
+check_production
 upload
 tag
 push
 remind
-
-#echo "Pushing $branchname;
-#git push origin "$branchname";
-#git checkout $branchname ;
-#echo "Preparing to upload $branchname branch to $1 environment";
-#git ftp push -D -v -s "$1"
-#git checkout $CURRENTBRANCH;
