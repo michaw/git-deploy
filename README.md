@@ -23,6 +23,6 @@ Set up the preflight branch with:
 and set up the production environment with
 ```git config --add git-ftp.production.branch <branchname>```
 and
-```git config --add git-ftp.scope.branch <scopename>```
+```git config --add git-ftp.production.branch <scopename>```
 
 
